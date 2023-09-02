@@ -230,6 +230,7 @@ impl<F: SmallField> TreeHasher<F> for blake2::Blake2s256 {
     }
 }
 
+/*
 impl<F: SmallField> TreeHasher<F> for sha3::Keccak256 {
     type Output = [u8; 32];
     #[inline]
@@ -297,3 +298,4 @@ impl<F: SmallField> TreeHasher<F> for sha3::Keccak256 {
         output
     }
 }
+*/
