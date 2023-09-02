@@ -251,4 +251,296 @@ mod test {
         let worker = Worker::new_with_num_threads(8);
         assert!(owned_cs.check_if_satisfied(&worker));
     }
+
+    // Notes on benches:
+    // - we ignore equality asserts because we are lazy, but those are negligible contribution compared to keccak256 itself
+    // - we use random input (not zeroes), because constant propagation would not help much anyway, and it's more realistic case
+    // - allocation (8-bit constraints on bytes) are included in the proof, but why not?
+    // - PoW is turned off, because 2^20 bits for blake2s PoW is 30 ms anyway, negligible
+
+    use crate::{
+        cs::{
+            implementations::{
+                pow::NoPow,
+                transcript::{Blake2sTranscript, Transcript},
+            },
+            oracle::TreeHasher,
+        },
+        log,
+    };
+
+    #[test]
+    #[ignore]
+    fn run_keccak256_prover_non_recursive() {
+        use crate::blake2::Blake2s256;
+        type TreeHash = Blake2s256;
+        type Transcript = Blake2sTranscript;
+        prove_keccak256::<TreeHash, Transcript>(8 * (1 << 10));
+    }
+
+    fn prove_keccak256<
+        T: TreeHasher<GoldilocksField, Output = TR::CompatibleCap>,
+        TR: Transcript<GoldilocksField, TransciptParameters = ()>,
+    >(
+        len: usize,
+    ) {
+        use crate::cs::implementations::prover::ProofConfig;
+        use crate::field::goldilocks::GoldilocksExt2;
+        use crate::worker::Worker;
+
+        let worker = Worker::new_with_num_threads(8);
+
+        let quotient_lde_degree = 8; // Setup params are not split yet, so it's should be equal to max(FRI lde degree, quotient degree)
+        let fri_lde_degree = 8;
+        let cap_size = 16;
+        let mut prover_config = ProofConfig::default();
+        prover_config.fri_lde_factor = fri_lde_degree;
+        prover_config.pow_bits = 0; // not important in practice for anything. 2^20 Blake2s POW uses 30ms
+
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42 as u64);
+
+        let mut input = vec![];
+        for _ in 0..len {
+            let byte: u8 = rng.gen();
+            input.push(byte);
+        }
+
+        let geometry = CSGeometry {
+            num_columns_under_copy_permutation: 60,
+            num_witness_columns: 0,
+            num_constant_columns: 4,
+            max_allowed_constraint_degree: 4,
+        };
+
+        let max_variables = 1 << 25;
+        let max_trace_len = 1 << 19;
+
+        use crate::cs::cs_builder::*;
+        use crate::cs::GateConfigurationHolder;
+        use crate::cs::StaticToolboxHolder;
+
+        fn configure<
+            T: CsBuilderImpl<F, T>,
+            GC: GateConfigurationHolder<F>,
+            TB: StaticToolboxHolder,
+        >(
+            builder: CsBuilder<T, F, GC, TB>,
+        ) -> CsBuilder<T, F, impl GateConfigurationHolder<F>, impl StaticToolboxHolder> {
+            let num_lookups = 8;
+            let builder = builder.allow_lookup(
+                crate::cs::LookupParameters::UseSpecializedColumnsWithTableIdAsConstant {
+                    width: 3,
+                    num_repetitions: num_lookups,
+                    share_table_id: true,
+                },
+            );
+            let builder = ConstantsAllocatorGate::configure_builder(
+                builder,
+                GatePlacementStrategy::UseGeneralPurposeColumns,
+            );
+            let builder = FmaGateInBaseFieldWithoutConstant::configure_builder(
+                builder,
+                GatePlacementStrategy::UseGeneralPurposeColumns,
+            );
+            let builder = ReductionGate::<F, 4>::configure_builder(
+                builder,
+                GatePlacementStrategy::UseGeneralPurposeColumns,
+            );
+            let builder = NopGate::configure_builder(
+                builder,
+                GatePlacementStrategy::UseGeneralPurposeColumns,
+            );
+
+            builder
+        }
+
+        {
+            // satisfiability check
+            let builder_impl = CsReferenceImplementationBuilder::<F, F, DevCSConfig>::new(
+                geometry,
+                max_variables,
+                max_trace_len,
+            );
+            let builder = new_builder::<_, F>(builder_impl);
+
+            let builder = configure(builder);
+            let mut owned_cs = builder.build(());
+
+            // add tables
+            let table = create_xor8_table();
+            owned_cs.add_lookup_table::<Xor8Table, 3>(table);
+
+            let table = create_and8_table();
+            owned_cs.add_lookup_table::<And8Table, 3>(table);
+
+            let table = create_byte_split_table::<F, 1>();
+            owned_cs.add_lookup_table::<ByteSplitTable<1>, 3>(table);
+            let table = create_byte_split_table::<F, 2>();
+            owned_cs.add_lookup_table::<ByteSplitTable<2>, 3>(table);
+            let table = create_byte_split_table::<F, 3>();
+            owned_cs.add_lookup_table::<ByteSplitTable<3>, 3>(table);
+            let table = create_byte_split_table::<F, 4>();
+            owned_cs.add_lookup_table::<ByteSplitTable<4>, 3>(table);
+
+            let mut circuit_input = vec![];
+
+            let cs = &mut owned_cs;
+
+            let mut it = input.array_chunks::<2>();
+            for pair in &mut it {
+                let pair = UInt8::allocate_pair(cs, *pair);
+                circuit_input.extend(pair);
+            }
+
+            for el in it.remainder() {
+                let el = UInt8::allocate_checked(cs, *el);
+                circuit_input.push(el);
+            }
+
+            let _output = keccak256(cs, &circuit_input);
+            drop(cs);
+            owned_cs.pad_and_shrink();
+            let mut owned_cs = owned_cs.into_assembly();
+            assert!(owned_cs.check_if_satisfied(&worker));
+        }
+
+        use crate::cs::cs_builder_reference::*;
+        use crate::cs::cs_builder_verifier::*;
+
+        let builder_impl = CsReferenceImplementationBuilder::<F, F, SetupCSConfig>::new(
+            geometry,
+            max_variables,
+            max_trace_len,
+        );
+        let builder = new_builder::<_, F>(builder_impl);
+
+        let builder = configure(builder);
+        let mut owned_cs = builder.build(());
+
+        // add tables
+        let table = create_xor8_table();
+        owned_cs.add_lookup_table::<Xor8Table, 3>(table);
+
+        let table = create_and8_table();
+        owned_cs.add_lookup_table::<And8Table, 3>(table);
+
+        let table = create_byte_split_table::<F, 1>();
+        owned_cs.add_lookup_table::<ByteSplitTable<1>, 3>(table);
+
+        let table = create_byte_split_table::<F, 2>();
+        owned_cs.add_lookup_table::<ByteSplitTable<2>, 3>(table);
+
+        let table = create_byte_split_table::<F, 3>();
+        owned_cs.add_lookup_table::<ByteSplitTable<3>, 3>(table);
+
+        let table = create_byte_split_table::<F, 4>();
+        owned_cs.add_lookup_table::<ByteSplitTable<4>, 3>(table);
+
+        let mut circuit_input = vec![];
+
+        let cs = &mut owned_cs;
+
+        let mut it = input.array_chunks::<2>();
+        for pair in &mut it {
+            let pair = UInt8::allocate_pair(cs, *pair);
+            circuit_input.extend(pair);
+        }
+
+        for el in it.remainder() {
+            let el = UInt8::allocate_checked(cs, *el);
+            circuit_input.push(el);
+        }
+
+        let _output = keccak256(cs, &circuit_input);
+        drop(cs);
+        let (_, padding_hint) = owned_cs.pad_and_shrink();
+        let owned_cs = owned_cs.into_assembly();
+        owned_cs.print_gate_stats();
+
+        let (base_setup, setup, vk, setup_tree, vars_hint, wits_hint) =
+            owned_cs.get_full_setup::<T>(&worker, quotient_lde_degree, cap_size);
+
+        let builder_impl = CsReferenceImplementationBuilder::<F, F, ProvingCSConfig>::new(
+            geometry,
+            max_variables,
+            max_trace_len,
+        );
+        let builder = new_builder::<_, F>(builder_impl);
+
+        let builder = configure(builder);
+        let mut owned_cs = builder.build(());
+
+        // add tables
+        let table = create_xor8_table();
+        owned_cs.add_lookup_table::<Xor8Table, 3>(table);
+
+        let table = create_and8_table();
+        owned_cs.add_lookup_table::<And8Table, 3>(table);
+
+        let table = create_byte_split_table::<F, 1>();
+        owned_cs.add_lookup_table::<ByteSplitTable<1>, 3>(table);
+
+        let table = create_byte_split_table::<F, 2>();
+        owned_cs.add_lookup_table::<ByteSplitTable<2>, 3>(table);
+
+        let table = create_byte_split_table::<F, 3>();
+        owned_cs.add_lookup_table::<ByteSplitTable<3>, 3>(table);
+
+        let table = create_byte_split_table::<F, 4>();
+        owned_cs.add_lookup_table::<ByteSplitTable<4>, 3>(table);
+
+        // create setup
+        let now = std::time::Instant::now();
+        log!("Start synthesis for proving");
+        let mut circuit_input = vec![];
+
+        let cs = &mut owned_cs;
+
+        let mut it = input.array_chunks::<2>();
+        for pair in &mut it {
+            let pair = UInt8::allocate_pair(cs, *pair);
+            circuit_input.extend(pair);
+        }
+
+        for el in it.remainder() {
+            let el = UInt8::allocate_checked(cs, *el);
+            circuit_input.push(el);
+        }
+
+        let _output = keccak256(cs, &circuit_input);
+        dbg!(now.elapsed());
+        log!("Synthesis for proving is done");
+        owned_cs.pad_and_shrink_using_hint(&padding_hint);
+        let mut owned_cs = owned_cs.into_assembly();
+
+        log!("Proving");
+        let witness_set = owned_cs.take_witness_using_hints(&worker, &vars_hint, &wits_hint);
+        log!("Witness is resolved");
+
+        let now = std::time::Instant::now();
+
+        let proof = owned_cs.prove_cpu_basic::<GoldilocksExt2, TR, T, NoPow>(
+            &worker,
+            witness_set,
+            &base_setup,
+            &setup,
+            &setup_tree,
+            &vk,
+            prover_config,
+            (),
+        );
+
+        log!("Proving is done, taken {:?}", now.elapsed());
+
+        let builder_impl = CsVerifierBuilder::<F, GoldilocksExt2>::new_from_parameters(geometry);
+        let builder = new_builder::<_, F>(builder_impl);
+
+        let builder = configure(builder);
+        let verifier = builder.build(());
+
+        let is_valid = verifier.verify::<T, TR, NoPow>((), &vk, &proof);
+
+        assert!(is_valid);
+    }
 }
