@@ -113,7 +113,9 @@ mod test {
     use super::*;
     use crate::{
         cs::{
-            gates::{ConstantsAllocatorGate, FmaGateInBaseFieldWithoutConstant, ReductionGate},
+            gates::{
+                ConstantsAllocatorGate, FmaGateInBaseFieldWithoutConstant, NopGate, ReductionGate,
+            },
             CSGeometry,
         },
         field::goldilocks::GoldilocksField,
@@ -200,6 +202,8 @@ mod test {
             builder,
             GatePlacementStrategy::UseGeneralPurposeColumns,
         );
+        let builder =
+            NopGate::configure_builder(builder, GatePlacementStrategy::UseGeneralPurposeColumns);
 
         let mut owned_cs = builder.build(());
 
@@ -240,7 +244,11 @@ mod test {
         assert_eq!(output, reference_output);
 
         drop(cs);
+        owned_cs.pad_and_shrink();
         let mut owned_cs = owned_cs.into_assembly();
         owned_cs.wait_for_witness();
+        use crate::worker::Worker;
+        let worker = Worker::new_with_num_threads(8);
+        assert!(owned_cs.check_if_satisfied(&worker));
     }
 }
