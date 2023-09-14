@@ -278,6 +278,30 @@ mod test {
         prove_keccak256::<TreeHash, Transcript>(8 * (1 << 10));
     }
 
+    #[test]
+    #[ignore]
+    fn run_keccak256_prover_recursive_mode() {
+        use crate::algebraic_props::round_function::AbsorptionModeOverwrite;
+        use crate::algebraic_props::sponge::GoldilocksPoseidonSponge;
+        use crate::cs::implementations::transcript::GoldilocksPoisedonTranscript;
+
+        type TreeHash = GoldilocksPoseidonSponge<AbsorptionModeOverwrite>;
+        type Transcript = GoldilocksPoisedonTranscript;
+        prove_keccak256::<TreeHash, Transcript>(8 * (1 << 10));
+    }
+
+    #[test]
+    #[ignore]
+    fn run_keccak256_prover_recursive_mode_poseidon2() {
+        use crate::algebraic_props::round_function::AbsorptionModeOverwrite;
+        use crate::algebraic_props::sponge::GoldilocksPoseidon2Sponge;
+        use crate::cs::implementations::transcript::GoldilocksPoisedonTranscript;
+
+        type TreeHash = GoldilocksPoseidon2Sponge<AbsorptionModeOverwrite>;
+        type Transcript = GoldilocksPoisedonTranscript;
+        prove_keccak256::<TreeHash, Transcript>(8 * (1 << 10));
+    }
+
     fn prove_keccak256<
         T: TreeHasher<GoldilocksField, Output = TR::CompatibleCap>,
         TR: Transcript<GoldilocksField, TransciptParameters = ()>,
